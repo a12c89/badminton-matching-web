@@ -1,4 +1,5 @@
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -47,6 +48,15 @@ from ..services.matching import ensure_day_session, generate_matches
 router = APIRouter()
 
 DEFAULT_CLUB_ID = 1
+KST = ZoneInfo("Asia/Seoul")
+
+
+def _now_kst() -> datetime:
+    return datetime.now(KST).replace(tzinfo=None)
+
+
+def _today_kst() -> date:
+    return _now_kst().date()
 
 
 def _active_member_ids(db: Session, club_id: int, day_date: date) -> set[int]:
@@ -163,6 +173,23 @@ def _match_member_ids(match: Match) -> list[int]:
     return [int(x) for x in (match.team_a + "," + match.team_b).split(",") if x]
 
 
+def _dedupe_active_by_court(matches: list[Match]) -> list[Match]:
+    unique_active_by_court: dict[int, Match] = {}
+    for match in matches:
+        court = match.court_number or 0
+        if court <= 0:
+            continue
+        prev = unique_active_by_court.get(court)
+        if prev is None:
+            unique_active_by_court[court] = match
+            continue
+        prev_key = (prev.start_at or datetime.min, prev.id)
+        curr_key = (match.start_at or datetime.min, match.id)
+        if curr_key > prev_key:
+            unique_active_by_court[court] = match
+    return sorted(unique_active_by_court.values(), key=lambda m: (m.court_number or 0, m.id))
+
+
 def _sanitize_active_matches(db: Session, club_id: int, day_date: date) -> list[Match]:
     """active 경기 정합성 보정: 코트당 1경기, 선수 중복 금지."""
     active_matches = (
@@ -204,7 +231,7 @@ def _sanitize_active_matches(db: Session, club_id: int, day_date: date) -> list[
         )
         removable_members = removed_member_ids - used_members
         if removable_members:
-            now_local = datetime.now()
+            now_local = _now_kst()
             sessions = (
                 db.query(LoginSession)
                 .filter(
@@ -257,7 +284,7 @@ def _sanitize_scheduled_queue(db: Session, club_id: int, day_date: date) -> list
 
 def _remove_member_from_today_flow(db: Session, club_id: int, member_id: int, today: date) -> None:
     """로그아웃 회원을 오늘의 대기/다음경기/코트 흐름에서 완전히 제거합니다."""
-    now = datetime.now()
+    now = _now_kst()
     matches = (
         db.query(Match)
         .filter(
@@ -368,22 +395,23 @@ def update_admin_code(payload: AdminCodeUpdate, db: Session = Depends(get_db)):
 def reset_day(db: Session = Depends(get_db)):
     club_id = DEFAULT_CLUB_ID
     now = datetime.utcnow()
+    today = _today_kst()
     db.query(LoginSession).filter(LoginSession.club_id == club_id, LoginSession.is_active.is_(True)).update(
         {LoginSession.is_active: False, LoginSession.is_in_match: False, LoginSession.logout_at: now}
     )
     db.query(MatchParticipant).filter(
-        MatchParticipant.day_date == date.today()
+        MatchParticipant.day_date == today
     ).delete()
     db.query(Match).filter(
-        Match.club_id == club_id, Match.day_date == date.today()
+        Match.club_id == club_id, Match.day_date == today
     ).delete()
     db.query(LessonQueue).filter(LessonQueue.club_id == club_id, LessonQueue.is_active.is_(True)).update(
         {LessonQueue.is_active: False}
     )
     db.query(MatchRequest).filter(
-        MatchRequest.club_id == club_id, MatchRequest.day_date == date.today()
+        MatchRequest.club_id == club_id, MatchRequest.day_date == today
     ).delete()
-    day_session = ensure_day_session(db, club_id, date.today())
+    day_session = ensure_day_session(db, club_id, today)
     day_session.first_login_at = None
     db.commit()
     return {"ok": True}
@@ -395,7 +423,7 @@ def admin_update_match_teams(
 ):
     """관리자 전용: 대기 경기(scheduled)의 선수를 대기자·다음경기 큐 인원으로 1명~4명 임의 수정합니다."""
     club_id = DEFAULT_CLUB_ID
-    today = date.today()
+    today = _today_kst()
     match = (
         db.query(Match)
         .filter(
@@ -581,7 +609,7 @@ def get_public_ranking(db: Session = Depends(get_db)):
         .filter(LoginSession.club_id == club_id, LoginSession.is_active.is_(True))
         .all()
     }
-    today = date.today()
+    today = _today_kst()
     baseline_updated = False
     for member in members:
         if member.day_start_date != today:
@@ -788,7 +816,7 @@ def update_member_grade(member_id: int, payload: MemberUpdateGrade, db: Session 
 
 @router.post("/auth/login", response_model=LoginSessionOut)
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    _cleanup_stale_sessions(db, DEFAULT_CLUB_ID, date.today())
+    _cleanup_stale_sessions(db, DEFAULT_CLUB_ID, _today_kst())
     birth_year = _normalize_birth_year(payload.birth_year)
     member = (
         db.query(Member)
@@ -808,7 +836,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     )
     if existing:
         return existing
-    now = datetime.now()
+    now = _now_kst()
     session = LoginSession(
         club_id=DEFAULT_CLUB_ID,
         member_id=member.id,
@@ -818,11 +846,11 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         is_guest=payload.is_guest,
     )
     db.add(session)
-    today = date.today()
+    today = _today_kst()
     if member.day_start_date != today:
         member.day_start_date = today
         member.day_start_rank_position = member.rank_position
-    day_session = ensure_day_session(db, DEFAULT_CLUB_ID, date.today())
+    day_session = ensure_day_session(db, DEFAULT_CLUB_ID, today)
     if not day_session.first_login_at:
         day_session.first_login_at = session.login_at
     db.commit()
@@ -840,7 +868,7 @@ def logout(payload: LogoutRequest, db: Session = Depends(get_db)):
     session.is_active = False
     session.logout_at = datetime.utcnow()
     session.is_in_match = False
-    _remove_member_from_today_flow(db, club_id, member_id, date.today())
+    _remove_member_from_today_flow(db, club_id, member_id, _today_kst())
     db.commit()
     return {"ok": True}
 
@@ -890,7 +918,7 @@ def create_match_request(payload: MatchRequestCreate, db: Session = Depends(get_
     )
     if not requester_session:
         raise HTTPException(status_code=400, detail="오늘 출석한 회원만 희망 매치업을 등록할 수 있습니다.")
-    today = date.today()
+    today = _today_kst()
     exists = (
         db.query(MatchRequest)
         .filter(
@@ -1038,7 +1066,7 @@ def finish_match(payload: MatchFinishRequest, db: Session = Depends(get_db)):
         .filter(LoginSession.member_id.in_(team_a_ids + team_b_ids), LoginSession.is_active.is_(True))
         .all()
     )
-    now = datetime.now()
+    now = _now_kst()
     for session in sessions:
         session.is_in_match = False
         session.login_at = now
@@ -1135,7 +1163,7 @@ def finish_match(payload: MatchFinishRequest, db: Session = Depends(get_db)):
 @router.get("/dashboard", response_model=DashboardOut)
 def get_dashboard(db: Session = Depends(get_db)):
     club_id = DEFAULT_CLUB_ID
-    now = datetime.now()
+    now = _now_kst()
     today = now.date()
     _cleanup_stale_sessions(db, club_id, today)
     pending_sessions = (
@@ -1168,12 +1196,14 @@ def get_dashboard(db: Session = Depends(get_db)):
             db.commit()
     club = get_default_club(db)
     _sanitize_active_matches(db, club_id, today)
+    db.flush()
     active_matches = (
         db.query(Match)
         .filter(Match.club_id == club_id, Match.day_date == today, Match.status == "active")
         .order_by(Match.court_number.asc())
         .all()
     )
+    active_matches = _dedupe_active_by_court(active_matches)
     scheduled_matches = _sanitize_scheduled_queue(db, club_id, today)
     available_courts = _available_courts(db, club_id, today)
     if available_courts:
@@ -1236,6 +1266,7 @@ def get_dashboard(db: Session = Depends(get_db)):
             .order_by(Match.court_number.asc())
             .all()
         )
+        active_matches = _dedupe_active_by_court(active_matches)
     courts: list[CourtDisplay] = []
     for match in active_matches:
         team_a_ids = [int(x) for x in match.team_a.split(",") if x]

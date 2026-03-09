@@ -62,7 +62,7 @@ def get_member_lesson_windows(
     windows: Dict[int, Tuple[datetime, datetime]] = {}
     for start_at, end_at, members in schedule:
         window_start = start_at - timedelta(minutes=10)
-        window_end = end_at
+        window_end = end_at + timedelta(minutes=5)
         for member in members:
             windows[member.id] = (window_start, window_end)
     return windows
