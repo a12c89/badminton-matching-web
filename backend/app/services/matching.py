@@ -35,6 +35,8 @@ BALANCE_WEIGHT = 200
 MIX_OVER_PENALTY = 200
 MIX_UNDER_BONUS = 120
 FORCE_MIX_PENALTY = 1_000_000
+TYPE_BALANCE_BONUS = 220
+TYPE_BALANCE_PENALTY = 120
 
 
 def ensure_day_session(db: Session, club_id: int, day_date: date) -> DaySession:
@@ -275,6 +277,14 @@ def _candidate_score(
                 score += (mixed_count - same_count) * MIX_OVER_PENALTY
             elif same_count > mixed_count:
                 score -= (same_count - mixed_count) * MIX_UNDER_BONUS
+    match_type = _match_type_from_members(members)
+    if type_counts and match_type in ("MM", "FF", "MIX"):
+        min_count = min(type_counts.get("MM", 0), type_counts.get("FF", 0), type_counts.get("MIX", 0))
+        curr_count = type_counts.get(match_type, 0)
+        if curr_count == min_count:
+            score -= TYPE_BALANCE_BONUS
+        else:
+            score += (curr_count - min_count) * TYPE_BALANCE_PENALTY
     genders = {m.gender for m in members}
     is_mixed = len(genders) > 1
     return MatchCandidate(members=members, team_a=team_a, team_b=team_b, score=score, is_mixed=is_mixed)
@@ -609,15 +619,26 @@ def generate_matches(
 
     while court_index < len(courts):
         remaining_candidates = [m for m in members if m.id not in used_member_ids]
+        desired_type = _desired_match_type(remaining_candidates, type_counts)
         candidate = _select_group_by_anchor(
             remaining_candidates,
             teammate_pairs,
             opponent_pairs,
             waiting_index,
-            desired_type=None,
+            desired_type=desired_type,
             type_counts=type_counts,
             balance_counts=balance_counts,
         )
+        if not candidate and desired_type is not None:
+            candidate = _select_group_by_anchor(
+                remaining_candidates,
+                teammate_pairs,
+                opponent_pairs,
+                waiting_index,
+                desired_type=None,
+                type_counts=type_counts,
+                balance_counts=balance_counts,
+            )
         if not candidate:
             break
         take_candidate(candidate)
@@ -687,15 +708,26 @@ def build_next_match_candidates(
             remaining = [m for m in remaining if m.id not in used_ids]
     while len(candidates) < limit and len(remaining) >= 4:
         waiting_index = {m.id: idx for idx, m in enumerate(remaining)}
+        desired_type = _desired_match_type(remaining, type_counts)
         candidate = _select_group_by_anchor(
             remaining,
             teammate_pairs,
             opponent_pairs,
             waiting_index,
-            desired_type=None,
+            desired_type=desired_type,
             type_counts=type_counts,
             balance_counts=balance_counts,
         )
+        if not candidate and desired_type is not None:
+            candidate = _select_group_by_anchor(
+                remaining,
+                teammate_pairs,
+                opponent_pairs,
+                waiting_index,
+                desired_type=None,
+                type_counts=type_counts,
+                balance_counts=balance_counts,
+            )
         # 인원이 적을 때: 이상적인 조합(MM/FF/MIX 2-2)이 없어도 대기 순서대로 4명 뽑아서 경기 생성 (한 번 같이 한 사람끼리도 허용)
         if not candidate and len(remaining) >= 4:
             fallback_members = remaining[:4]
