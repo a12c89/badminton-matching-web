@@ -163,6 +163,64 @@ def _match_member_ids(match: Match) -> list[int]:
     return [int(x) for x in (match.team_a + "," + match.team_b).split(",") if x]
 
 
+def _sanitize_active_matches(db: Session, club_id: int, day_date: date) -> list[Match]:
+    """active 경기 정합성 보정: 코트당 1경기, 선수 중복 금지."""
+    active_matches = (
+        db.query(Match)
+        .filter(Match.club_id == club_id, Match.day_date == day_date, Match.status == "active")
+        .order_by(Match.start_at.desc().nullslast(), Match.id.desc())
+        .all()
+    )
+    keep: list[Match] = []
+    used_courts: set[int] = set()
+    used_members: set[int] = set()
+    removed_match_ids: list[int] = []
+    removed_member_ids: set[int] = set()
+    now_utc = datetime.utcnow()
+    for match in active_matches:
+        member_ids = _match_member_ids(match)
+        unique_ids = set(member_ids)
+        court = match.court_number or 0
+        invalid = (
+            not court
+            or len(member_ids) != 4
+            or len(unique_ids) != 4
+            or court in used_courts
+            or bool(unique_ids.intersection(used_members))
+        )
+        if invalid:
+            match.status = "completed"
+            match.end_at = match.end_at or now_utc
+            removed_match_ids.append(match.id)
+            removed_member_ids.update(unique_ids)
+            continue
+        keep.append(match)
+        used_courts.add(court)
+        used_members.update(unique_ids)
+
+    if removed_match_ids:
+        db.query(MatchParticipant).filter(MatchParticipant.match_id.in_(removed_match_ids)).delete(
+            synchronize_session=False
+        )
+        removable_members = removed_member_ids - used_members
+        if removable_members:
+            now_local = datetime.now()
+            sessions = (
+                db.query(LoginSession)
+                .filter(
+                    LoginSession.club_id == club_id,
+                    LoginSession.member_id.in_(list(removable_members)),
+                    LoginSession.is_active.is_(True),
+                )
+                .all()
+            )
+            for session in sessions:
+                session.is_in_match = False
+                session.login_at = now_local
+                session.wait_started_at = now_local
+    return keep
+
+
 def _sanitize_scheduled_queue(db: Session, club_id: int, day_date: date) -> list[Match]:
     """scheduled 큐에서 중복/충돌 경기를 제거하고 queue_position을 1부터 재정렬합니다."""
     scheduled = (
@@ -985,6 +1043,7 @@ def finish_match(payload: MatchFinishRequest, db: Session = Depends(get_db)):
         session.is_in_match = False
         session.login_at = now
         session.wait_started_at = now
+    _sanitize_active_matches(db, match.club_id, now.date())
     db.commit()
     scheduled_queue = _sanitize_scheduled_queue(db, match.club_id, now.date())
     next_scheduled = scheduled_queue[0] if scheduled_queue else None
@@ -1108,6 +1167,7 @@ def get_dashboard(db: Session = Depends(get_db)):
             day_session.first_login_at = earliest_active.login_at
             db.commit()
     club = get_default_club(db)
+    _sanitize_active_matches(db, club_id, today)
     active_matches = (
         db.query(Match)
         .filter(Match.club_id == club_id, Match.day_date == today, Match.status == "active")
