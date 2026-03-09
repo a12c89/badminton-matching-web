@@ -122,6 +122,37 @@ def _active_sessions_for_member(db: Session, club_id: int, member_id: int) -> li
     )
 
 
+def _collapse_duplicate_active_sessions(db: Session, club_id: int, today: date) -> None:
+    """활성 세션을 회원당 1개(최초 로그인)로 정규화합니다."""
+    sessions = (
+        db.query(LoginSession)
+        .filter(
+            LoginSession.club_id == club_id,
+            LoginSession.is_active.is_(True),
+            func.date(LoginSession.login_at) == today,
+        )
+        .order_by(LoginSession.member_id.asc(), LoginSession.login_at.asc(), LoginSession.id.asc())
+        .all()
+    )
+    by_member: dict[int, list[LoginSession]] = {}
+    for session in sessions:
+        by_member.setdefault(session.member_id, []).append(session)
+    now_utc = datetime.utcnow()
+    changed = False
+    for member_sessions in by_member.values():
+        if len(member_sessions) <= 1:
+            continue
+        keep = member_sessions[0]
+        keep.is_in_match = any(s.is_in_match for s in member_sessions)
+        for extra in member_sessions[1:]:
+            extra.is_active = False
+            extra.is_in_match = False
+            extra.logout_at = now_utc
+        changed = True
+    if changed:
+        db.flush()
+
+
 def _create_matches(db: Session, club_id: int, matches: list[Match]) -> int:
     if not matches:
         return 0
@@ -648,6 +679,7 @@ def list_members(db: Session = Depends(get_db)):
     club_id = DEFAULT_CLUB_ID
     today = _today_kst()
     _cleanup_stale_sessions(db, club_id, today)
+    _collapse_duplicate_active_sessions(db, club_id, today)
     active_ids = {
         row.member_id
         for row in db.query(LoginSession.member_id)
@@ -670,9 +702,10 @@ def list_members(db: Session = Depends(get_db)):
 @router.get("/public/ranking", response_model=list[PublicRankingItem])
 def get_public_ranking(db: Session = Depends(get_db)):
     club_id = DEFAULT_CLUB_ID
-    _cleanup_stale_sessions(db, club_id, _today_kst())
-    members = db.query(Member).filter(Member.club_id == club_id).all()
     today = _today_kst()
+    _cleanup_stale_sessions(db, club_id, today)
+    _collapse_duplicate_active_sessions(db, club_id, today)
+    members = db.query(Member).filter(Member.club_id == club_id).all()
     active_ids = {
         row.member_id
         for row in db.query(LoginSession.member_id)
@@ -1258,6 +1291,7 @@ def get_dashboard(db: Session = Depends(get_db)):
     club_id = DEFAULT_CLUB_ID
     now = _now_kst()
     today = now.date()
+    _collapse_duplicate_active_sessions(db, club_id, today)
     lesson_schedule = get_lesson_schedule(db, club_id, today)
     lesson_windows = get_member_lesson_windows(lesson_schedule)
     lesson_ids: set[int] = set(lesson_windows.keys())
@@ -1410,7 +1444,7 @@ def get_dashboard(db: Session = Depends(get_db)):
                 team_b_genders=[m.gender for m in team_b],
             )
         )
-    sessions = (
+    sessions_raw = (
         db.query(LoginSession, Member)
         .join(Member, LoginSession.member_id == Member.id)
         .filter(
@@ -1418,9 +1452,16 @@ def get_dashboard(db: Session = Depends(get_db)):
             LoginSession.is_active.is_(True),
             func.date(LoginSession.login_at) == today,
         )
-        .order_by(LoginSession.login_at.asc())
+        .order_by(LoginSession.login_at.asc(), LoginSession.id.asc())
         .all()
     )
+    sessions: list[tuple[LoginSession, Member]] = []
+    seen_member_ids: set[int] = set()
+    for session, member in sessions_raw:
+        if member.id in seen_member_ids:
+            continue
+        seen_member_ids.add(member.id)
+        sessions.append((session, member))
     total_logged_in = len(sessions)
     in_match_count = sum(1 for session, _ in sessions if session.is_in_match)
     lesson_count = sum(1 for _, member in sessions if member.id in lesson_ids)
