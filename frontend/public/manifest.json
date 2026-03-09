@@ -1,0 +1,9 @@
+{
+  "name": "배드민턴 자동 대진",
+  "short_name": "대진매칭",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#2b61ff",
+  "icons": []
+}
