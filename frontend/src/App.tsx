@@ -458,22 +458,19 @@ export default function App() {
     return `${hh}시 ${mm}분`;
   };
 
-  const renderTeam = (names: string[], genders?: string[], ids?: number[]) => {
+  const renderTeam = (names: string[], genders?: string[]) => {
     return (
       <div className="team-row">
-        {names.map((name, idx) => {
-          const selfClass = memberId && ids?.[idx] === memberId ? "self" : "";
-          return (
-            <span
-              key={`${name}-${idx}`}
-              className={`waiting-chip name-chip ${selfClass} ${
-                genders?.[idx] === "M" ? "male" : genders?.[idx] === "F" ? "female" : "neutral"
-              }`}
-            >
-              {name}
-            </span>
-          );
-        })}
+        {names.map((name, idx) => (
+          <span
+            key={`${name}-${idx}`}
+            className={`waiting-chip name-chip ${
+              genders?.[idx] === "M" ? "male" : genders?.[idx] === "F" ? "female" : "neutral"
+            }`}
+          >
+            {name}
+          </span>
+        ))}
       </div>
     );
   };
@@ -644,8 +641,8 @@ export default function App() {
               dashboard.courts.map((court) => (
                 <div key={court.court_number}>
                   <div className="tag">{court.court_number}코트</div>
-                  {renderTeam(court.team_a, court.team_a_genders, court.team_a_ids)} vs{" "}
-                  {renderTeam(court.team_b, court.team_b_genders, court.team_b_ids)}
+                  {renderTeam(court.team_a, court.team_a_genders)} vs{" "}
+                  {renderTeam(court.team_b, court.team_b_genders)}
                   <div className="row" style={{ marginTop: 6 }}>
                     <input
                       placeholder="A 점수"

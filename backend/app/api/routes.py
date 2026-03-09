@@ -117,7 +117,7 @@ def _active_sessions_for_member(db: Session, club_id: int, member_id: int) -> li
             LoginSession.member_id == member_id,
             LoginSession.is_active.is_(True),
         )
-        .order_by(LoginSession.login_at.desc(), LoginSession.id.desc())
+        .order_by(LoginSession.login_at.asc(), LoginSession.id.asc())
         .all()
     )
 
@@ -647,6 +647,7 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)):
 def list_members(db: Session = Depends(get_db)):
     club_id = DEFAULT_CLUB_ID
     today = _today_kst()
+    _cleanup_stale_sessions(db, club_id, today)
     active_ids = {
         row.member_id
         for row in db.query(LoginSession.member_id)
@@ -669,6 +670,7 @@ def list_members(db: Session = Depends(get_db)):
 @router.get("/public/ranking", response_model=list[PublicRankingItem])
 def get_public_ranking(db: Session = Depends(get_db)):
     club_id = DEFAULT_CLUB_ID
+    _cleanup_stale_sessions(db, club_id, _today_kst())
     members = db.query(Member).filter(Member.club_id == club_id).all()
     today = _today_kst()
     active_ids = {
