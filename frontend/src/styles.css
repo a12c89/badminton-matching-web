@@ -62,18 +62,21 @@ button.secondary {
 }
 
 .tag {
-  display: inline-block;
-  padding: 4px 8px;
-  border-radius: 999px;
-  background: #edf1ff;
-  color: #2b61ff;
-  font-size: 12px;
+  display: inline;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #111;
+  font-size: 14px;
+  font-weight: 600;
   margin-right: 6px;
 }
 
 .tag.time-tag {
-  background: rgba(132, 204, 22, 0.15);
-  color: #4d7c0f;
+  background: transparent;
+  color: #6b7280;
+  font-size: 13px;
+  font-weight: 400;
 }
 
 .toggle {
