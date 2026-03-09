@@ -109,6 +109,19 @@ def _member_exists(
     return db.query(query.exists()).scalar() or False
 
 
+def _active_sessions_for_member(db: Session, club_id: int, member_id: int) -> list[LoginSession]:
+    return (
+        db.query(LoginSession)
+        .filter(
+            LoginSession.club_id == club_id,
+            LoginSession.member_id == member_id,
+            LoginSession.is_active.is_(True),
+        )
+        .order_by(LoginSession.login_at.desc(), LoginSession.id.desc())
+        .all()
+    )
+
+
 def _create_matches(db: Session, club_id: int, matches: list[Match]) -> int:
     if not matches:
         return 0
@@ -572,16 +585,24 @@ def admin_update_match_teams(
 
 @router.post("/admin/force-logout/{member_id}")
 def force_logout_member(member_id: int, db: Session = Depends(get_db)):
-    session = (
-        db.query(LoginSession)
-        .filter(LoginSession.member_id == member_id, LoginSession.is_active.is_(True))
-        .first()
-    )
-    if not session:
+    club_id = DEFAULT_CLUB_ID
+    active_sessions = _active_sessions_for_member(db, club_id, member_id)
+    if not active_sessions:
         raise HTTPException(status_code=404, detail="활성 세션이 없습니다.")
-    session.is_active = False
-    session.is_in_match = False
-    session.logout_at = datetime.utcnow()
+    now_utc = datetime.utcnow()
+    db.query(LoginSession).filter(
+        LoginSession.club_id == club_id,
+        LoginSession.member_id == member_id,
+        LoginSession.is_active.is_(True),
+    ).update(
+        {
+            LoginSession.is_active: False,
+            LoginSession.is_in_match: False,
+            LoginSession.logout_at: now_utc,
+        },
+        synchronize_session=False,
+    )
+    _remove_member_from_today_flow(db, club_id, member_id, _today_kst())
     db.commit()
     return {"ok": True}
 
@@ -625,10 +646,15 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)):
 @router.get("/members", response_model=list[MemberOut])
 def list_members(db: Session = Depends(get_db)):
     club_id = DEFAULT_CLUB_ID
+    today = _today_kst()
     active_ids = {
         row.member_id
         for row in db.query(LoginSession.member_id)
-        .filter(LoginSession.club_id == club_id, LoginSession.is_active.is_(True))
+        .filter(
+            LoginSession.club_id == club_id,
+            LoginSession.is_active.is_(True),
+            func.date(LoginSession.login_at) == today,
+        )
         .all()
     }
     members = db.query(Member).filter(Member.club_id == club_id).all()
@@ -644,13 +670,17 @@ def list_members(db: Session = Depends(get_db)):
 def get_public_ranking(db: Session = Depends(get_db)):
     club_id = DEFAULT_CLUB_ID
     members = db.query(Member).filter(Member.club_id == club_id).all()
+    today = _today_kst()
     active_ids = {
         row.member_id
         for row in db.query(LoginSession.member_id)
-        .filter(LoginSession.club_id == club_id, LoginSession.is_active.is_(True))
+        .filter(
+            LoginSession.club_id == club_id,
+            LoginSession.is_active.is_(True),
+            func.date(LoginSession.login_at) == today,
+        )
         .all()
     }
-    today = _today_kst()
     baseline_updated = False
     for member in members:
         if member.day_start_date != today:
@@ -870,13 +900,18 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     )
     if not member:
         raise HTTPException(status_code=404, detail="회원정보가 없습니다.")
-    existing = (
-        db.query(LoginSession)
-        .filter(LoginSession.member_id == member.id, LoginSession.is_active.is_(True))
-        .first()
-    )
-    if existing:
-        return existing
+    active_sessions = _active_sessions_for_member(db, DEFAULT_CLUB_ID, member.id)
+    if active_sessions:
+        keep = active_sessions[0]
+        if len(active_sessions) > 1:
+            now_utc = datetime.utcnow()
+            for extra in active_sessions[1:]:
+                extra.is_active = False
+                extra.is_in_match = False
+                extra.logout_at = now_utc
+            db.commit()
+            db.refresh(keep)
+        return keep
     now = _now_kst()
     session = LoginSession(
         club_id=DEFAULT_CLUB_ID,
@@ -906,9 +941,19 @@ def logout(payload: LogoutRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="세션이 없습니다.")
     club_id = session.club_id
     member_id = session.member_id
-    session.is_active = False
-    session.logout_at = datetime.utcnow()
-    session.is_in_match = False
+    now_utc = datetime.utcnow()
+    db.query(LoginSession).filter(
+        LoginSession.club_id == club_id,
+        LoginSession.member_id == member_id,
+        LoginSession.is_active.is_(True),
+    ).update(
+        {
+            LoginSession.is_active: False,
+            LoginSession.is_in_match: False,
+            LoginSession.logout_at: now_utc,
+        },
+        synchronize_session=False,
+    )
     _remove_member_from_today_flow(db, club_id, member_id, _today_kst())
     db.commit()
     return {"ok": True}
@@ -1241,7 +1286,11 @@ def get_dashboard(db: Session = Depends(get_db)):
     day_session = ensure_day_session(db, club_id, today)
     earliest_active = (
         db.query(LoginSession)
-        .filter(LoginSession.club_id == club_id, LoginSession.is_active.is_(True))
+        .filter(
+            LoginSession.club_id == club_id,
+            LoginSession.is_active.is_(True),
+            func.date(LoginSession.login_at) == today,
+        )
         .order_by(LoginSession.login_at.asc())
         .first()
     )
@@ -1362,7 +1411,11 @@ def get_dashboard(db: Session = Depends(get_db)):
     sessions = (
         db.query(LoginSession, Member)
         .join(Member, LoginSession.member_id == Member.id)
-        .filter(LoginSession.club_id == club_id, LoginSession.is_active.is_(True))
+        .filter(
+            LoginSession.club_id == club_id,
+            LoginSession.is_active.is_(True),
+            func.date(LoginSession.login_at) == today,
+        )
         .order_by(LoginSession.login_at.asc())
         .all()
     )
