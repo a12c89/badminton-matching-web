@@ -1,7 +1,3 @@
-"""
-Elo 기반 등수: 급수 시드 → 복식 경기 실시간 갱신, 연승 지수 가중, 30일 감쇠.
-등수는 elo_rating 기준 정렬, UI(등수/화살표)는 rank_position·last_rank_position으로 공급.
-"""
 from datetime import datetime
 import math
 from typing import Iterable
@@ -14,8 +10,8 @@ ELO_BASE = 1000
 LOCAL_WEIGHT = 50
 NATIONAL_WEIGHT = 200
 K_BASE = 24
-STREAK_MULT = 1.1  # 연승 시 K에 적용: K * STREAK_MULT^(streak-1)
-DECAY_DAYS = 30  # 마지막 경기 이후 일수에 따른 Elo 감쇠(시드로 회귀)
+STREAK_MULT = 1.1
+DECAY_DAYS = 30
 
 
 def compute_rank_group(local_grade: str | None, national_grade: str | None, is_player: bool) -> str:

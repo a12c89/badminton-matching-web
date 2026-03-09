@@ -1,28 +1,17 @@
-import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 from .db import Base, engine
 from .api.routes import router, get_default_club
 from .db import SessionLocal
-from .models import Member
-from .services.ranking import compute_seed_elo, recalculate_ranks
 
 
 app = FastAPI(title="Badminton Auto Matching")
 
-cors_origins_raw = os.getenv("CORS_ORIGINS", "*").strip()
-if cors_origins_raw == "*":
-    allow_origins = ["*"]
-else:
-    allow_origins = [origin.strip() for origin in cors_origins_raw.split(",") if origin.strip()]
-    if not allow_origins:
-        allow_origins = ["*"]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=False,
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -118,22 +107,6 @@ def on_startup():
                     text("UPDATE login_sessions SET wait_started_at=login_at WHERE wait_started_at IS NULL")
                 )
                 conn.commit()
-    # Elo 시드 백필: elo_rating이 NULL이거나 1500(구 기본값)인 회원을 급수 기반 시드로 설정
-    db = SessionLocal()
-    try:
-        members_to_seed = db.query(Member).filter(
-            (Member.elo_rating.is_(None)) | (Member.elo_rating == 1500.0)
-        ).all()
-        club_ids_updated = set()
-        for member in members_to_seed:
-            member.elo_rating = compute_seed_elo(member.local_grade, member.national_grade)
-            club_ids_updated.add(member.club_id)
-        for cid in club_ids_updated:
-            recalculate_ranks(db, cid)
-        if members_to_seed:
-            db.commit()
-    finally:
-        db.close()
     db = SessionLocal()
     try:
         get_default_club(db)

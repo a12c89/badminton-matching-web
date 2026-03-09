@@ -159,6 +159,69 @@ def _cleanup_stale_sessions(db: Session, club_id: int, today: date) -> None:
         db.commit()
 
 
+def _remove_member_from_today_flow(db: Session, club_id: int, member_id: int, today: date) -> None:
+    """로그아웃 회원을 오늘의 대기/다음경기/코트 흐름에서 완전히 제거합니다."""
+    now = datetime.now()
+    matches = (
+        db.query(Match)
+        .filter(
+            Match.club_id == club_id,
+            Match.day_date == today,
+            Match.status.in_(("active", "scheduled")),
+        )
+        .all()
+    )
+    removed_match_ids: list[int] = []
+    affected_member_ids: set[int] = set()
+    for match in matches:
+        ids = [int(x) for x in (match.team_a + "," + match.team_b).split(",") if x]
+        if member_id not in ids:
+            continue
+        removed_match_ids.append(match.id)
+        affected_member_ids.update(ids)
+        db.delete(match)
+
+    if removed_match_ids:
+        db.query(MatchParticipant).filter(MatchParticipant.match_id.in_(removed_match_ids)).delete(
+            synchronize_session=False
+        )
+        remaining = (
+            db.query(Match)
+            .filter(Match.club_id == club_id, Match.day_date == today, Match.status == "scheduled")
+            .order_by(Match.queue_position.asc())
+            .all()
+        )
+        for idx, match in enumerate(remaining, start=1):
+            match.queue_position = idx
+
+    affected_member_ids.discard(member_id)
+    if affected_member_ids:
+        sessions = (
+            db.query(LoginSession)
+            .filter(
+                LoginSession.club_id == club_id,
+                LoginSession.member_id.in_(list(affected_member_ids)),
+                LoginSession.is_active.is_(True),
+            )
+            .all()
+        )
+        for s in sessions:
+            s.is_in_match = False
+            s.login_at = now
+            s.wait_started_at = now
+
+    db.query(LessonQueue).filter(
+        LessonQueue.club_id == club_id,
+        LessonQueue.member_id == member_id,
+        LessonQueue.is_active.is_(True),
+    ).update({LessonQueue.is_active: False}, synchronize_session=False)
+    db.query(MatchRequest).filter(
+        MatchRequest.club_id == club_id,
+        MatchRequest.member_id == member_id,
+        MatchRequest.day_date == today,
+    ).delete(synchronize_session=False)
+
+
 def get_default_club(db: Session) -> Club:
     club = db.query(Club).filter(Club.id == DEFAULT_CLUB_ID).first()
     if not club:
@@ -683,9 +746,12 @@ def logout(payload: LogoutRequest, db: Session = Depends(get_db)):
     session = db.query(LoginSession).filter(LoginSession.id == payload.session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="세션이 없습니다.")
+    club_id = session.club_id
+    member_id = session.member_id
     session.is_active = False
     session.logout_at = datetime.utcnow()
     session.is_in_match = False
+    _remove_member_from_today_flow(db, club_id, member_id, date.today())
     db.commit()
     return {"ok": True}
 
