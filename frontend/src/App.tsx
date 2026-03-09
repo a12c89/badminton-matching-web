@@ -438,10 +438,8 @@ export default function App() {
 
   const formatExpectedTime = (value: string) => {
     const date = new Date(value);
-    // 백엔드 시간이 UTC 기준이므로 KST(+9)로 보정
-    const kst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
-    const hh = String(kst.getHours()).padStart(2, "0");
-    const mm = String(kst.getMinutes()).padStart(2, "0");
+    const hh = String(date.getHours()).padStart(2, "0");
+    const mm = String(date.getMinutes()).padStart(2, "0");
     return `${hh}시 ${mm}분`;
   };
 
@@ -455,27 +453,27 @@ export default function App() {
   const formatAttendanceTime = (value?: string | null) => {
     if (!value) return "";
     const date = new Date(value);
-    const kst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
-    const hh = String(kst.getHours()).padStart(2, "0");
-    const mm = String(kst.getMinutes()).padStart(2, "0");
+    const hh = String(date.getHours()).padStart(2, "0");
+    const mm = String(date.getMinutes()).padStart(2, "0");
     return `${hh}시 ${mm}분`;
   };
 
   const renderTeam = (names: string[], genders?: string[], ids?: number[]) => {
-    const hasSelf = memberId ? ids?.includes(memberId) : false;
-    const selfClass = hasSelf ? "self" : "";
     return (
       <div className="team-row">
-        {names.map((name, idx) => (
-          <span
-            key={`${name}-${idx}`}
-            className={`waiting-chip name-chip ${selfClass} ${
-              genders?.[idx] === "M" ? "male" : genders?.[idx] === "F" ? "female" : "neutral"
-            }`}
-          >
-            {name}
-          </span>
-        ))}
+        {names.map((name, idx) => {
+          const selfClass = memberId && ids?.[idx] === memberId ? "self" : "";
+          return (
+            <span
+              key={`${name}-${idx}`}
+              className={`waiting-chip name-chip ${selfClass} ${
+                genders?.[idx] === "M" ? "male" : genders?.[idx] === "F" ? "female" : "neutral"
+              }`}
+            >
+              {name}
+            </span>
+          );
+        })}
       </div>
     );
   };

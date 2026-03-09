@@ -201,6 +201,27 @@ def _blocked_lesson_member_ids(db: Session, club_id: int, today: date, now: date
     }
 
 
+def _sync_session_match_flags(db: Session, club_id: int, day_date: date, now: datetime) -> None:
+    """active 경기 기준으로 LoginSession.is_in_match를 동기화합니다."""
+    active_ids = _active_member_ids(db, club_id, day_date)
+    sessions = (
+        db.query(LoginSession)
+        .filter(LoginSession.club_id == club_id, LoginSession.is_active.is_(True))
+        .all()
+    )
+    changed = False
+    for session in sessions:
+        should_in_match = session.member_id in active_ids
+        if session.is_in_match == should_in_match:
+            continue
+        session.is_in_match = should_in_match
+        if not should_in_match and not session.wait_started_at:
+            session.wait_started_at = now
+        changed = True
+    if changed:
+        db.flush()
+
+
 def _sanitize_active_matches(db: Session, club_id: int, day_date: date) -> list[Match]:
     """active 경기 정합성 보정: 코트당 1경기, 선수 중복 금지."""
     active_matches = (
@@ -1238,6 +1259,7 @@ def get_dashboard(db: Session = Depends(get_db)):
         .all()
     )
     active_matches = _dedupe_active_by_court(active_matches)
+    _sync_session_match_flags(db, club_id, today, now)
     scheduled_matches = _sanitize_scheduled_queue(
         db, club_id, today, blocked_member_ids=blocked_lesson_ids
     )
@@ -1295,7 +1317,18 @@ def get_dashboard(db: Session = Depends(get_db)):
                 matches, _, _, _ = generate_matches(
                     db, club_id, now, court_numbers=available_courts, force_create=True
                 )
-            _create_matches(db, club_id, matches)
+            created = _create_matches(db, club_id, matches)
+            if created == 0 and available_courts:
+                active_ids_now = _active_member_ids(db, club_id, today)
+                matches, _, _, _ = generate_matches(
+                    db,
+                    club_id,
+                    now,
+                    court_numbers=available_courts,
+                    exclude_member_ids=active_ids_now,
+                    force_create=True,
+                )
+                _create_matches(db, club_id, matches)
         active_matches = (
             db.query(Match)
             .filter(Match.club_id == club_id, Match.day_date == today, Match.status == "active")
