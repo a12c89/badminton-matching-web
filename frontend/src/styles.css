@@ -76,11 +76,6 @@ button.secondary {
   color: #4d7c0f;
 }
 
-.highlight {
-  font-weight: 700;
-  color: #2b61ff;
-}
-
 .toggle {
   border: 1px solid #ccd6ff;
   background: #f4f6ff;
@@ -267,11 +262,6 @@ button.secondary {
 
 .name-chip {
   font-size: 13px;
-}
-
-.name-chip.self {
-  border-color: rgba(43, 97, 255, 0.6);
-  background: rgba(43, 97, 255, 0.06);
 }
 
 .next-matches {
