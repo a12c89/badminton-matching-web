@@ -41,6 +41,7 @@ from ..services.lesson import (
     format_waiting_label,
     get_lesson_schedule,
     build_lesson_display,
+    get_member_lesson_windows,
 )
 from ..services.matching import ensure_day_session, generate_matches
 
@@ -190,6 +191,16 @@ def _dedupe_active_by_court(matches: list[Match]) -> list[Match]:
     return sorted(unique_active_by_court.values(), key=lambda m: (m.court_number or 0, m.id))
 
 
+def _blocked_lesson_member_ids(db: Session, club_id: int, today: date, now: datetime) -> set[int]:
+    schedule = get_lesson_schedule(db, club_id, today)
+    windows = get_member_lesson_windows(schedule)
+    return {
+        member_id
+        for member_id, (window_start, window_end) in windows.items()
+        if window_start <= now <= window_end
+    }
+
+
 def _sanitize_active_matches(db: Session, club_id: int, day_date: date) -> list[Match]:
     """active 경기 정합성 보정: 코트당 1경기, 선수 중복 금지."""
     active_matches = (
@@ -248,7 +259,12 @@ def _sanitize_active_matches(db: Session, club_id: int, day_date: date) -> list[
     return keep
 
 
-def _sanitize_scheduled_queue(db: Session, club_id: int, day_date: date) -> list[Match]:
+def _sanitize_scheduled_queue(
+    db: Session,
+    club_id: int,
+    day_date: date,
+    blocked_member_ids: set[int] | None = None,
+) -> list[Match]:
     """scheduled 큐에서 중복/충돌 경기를 제거하고 queue_position을 1부터 재정렬합니다."""
     scheduled = (
         db.query(Match)
@@ -264,6 +280,10 @@ def _sanitize_scheduled_queue(db: Session, club_id: int, day_date: date) -> list
         member_ids = _match_member_ids(match)
         unique_ids = set(member_ids)
         if len(member_ids) != 4 or len(unique_ids) != 4:
+            removed_ids.append(match.id)
+            db.delete(match)
+            continue
+        if blocked_member_ids and unique_ids.intersection(blocked_member_ids):
             removed_ids.append(match.id)
             db.delete(match)
             continue
@@ -1026,7 +1046,7 @@ def reorder_lessons(payload: LessonQueueReorder, db: Session = Depends(get_db)):
 @router.post("/matches/generate")
 def generate_match_endpoint(db: Session = Depends(get_db)):
     club_id = DEFAULT_CLUB_ID
-    now = datetime.utcnow()
+    now = _now_kst()
     matches, next_candidates, waiting, lesson_lines = generate_matches(db, club_id, now)
     if not matches:
         return {
@@ -1071,9 +1091,12 @@ def finish_match(payload: MatchFinishRequest, db: Session = Depends(get_db)):
         session.is_in_match = False
         session.login_at = now
         session.wait_started_at = now
+    blocked_lesson_ids = _blocked_lesson_member_ids(db, match.club_id, now.date(), now)
     _sanitize_active_matches(db, match.club_id, now.date())
     db.commit()
-    scheduled_queue = _sanitize_scheduled_queue(db, match.club_id, now.date())
+    scheduled_queue = _sanitize_scheduled_queue(
+        db, match.club_id, now.date(), blocked_member_ids=blocked_lesson_ids
+    )
     next_scheduled = scheduled_queue[0] if scheduled_queue else None
     if next_scheduled:
         next_scheduled.status = "active"
@@ -1108,11 +1131,13 @@ def finish_match(payload: MatchFinishRequest, db: Session = Depends(get_db)):
             )
             if session:
                 session.is_in_match = True
-        _sanitize_scheduled_queue(db, match.club_id, now.date())
+        _sanitize_scheduled_queue(db, match.club_id, now.date(), blocked_member_ids=blocked_lesson_ids)
         db.commit()
 
     # 큐 보충: 남은 scheduled가 3개 미만이면 추가 생성
-    scheduled_matches = _sanitize_scheduled_queue(db, match.club_id, now.date())
+    scheduled_matches = _sanitize_scheduled_queue(
+        db, match.club_id, now.date(), blocked_member_ids=blocked_lesson_ids
+    )
     active_ids = _active_member_ids(db, match.club_id, now.date())
     scheduled_ids = {
         member_id
@@ -1151,7 +1176,7 @@ def finish_match(payload: MatchFinishRequest, db: Session = Depends(get_db)):
             db.flush()
             scheduled_matches.append(scheduled)
             used_ids |= candidate_ids
-            _sanitize_scheduled_queue(db, match.club_id, now.date())
+            _sanitize_scheduled_queue(db, match.club_id, now.date(), blocked_member_ids=blocked_lesson_ids)
             added = True
             break
         if not added:
@@ -1165,6 +1190,15 @@ def get_dashboard(db: Session = Depends(get_db)):
     club_id = DEFAULT_CLUB_ID
     now = _now_kst()
     today = now.date()
+    lesson_schedule = get_lesson_schedule(db, club_id, today)
+    lesson_windows = get_member_lesson_windows(lesson_schedule)
+    lesson_ids: set[int] = set(lesson_windows.keys())
+    blocked_lesson_ids = {
+        member_id
+        for member_id, (window_start, window_end) in lesson_windows.items()
+        if window_start <= now <= window_end
+    }
+    lesson_lines = build_lesson_display(lesson_schedule, now)
     _cleanup_stale_sessions(db, club_id, today)
     pending_sessions = (
         db.query(LoginSession)
@@ -1204,7 +1238,9 @@ def get_dashboard(db: Session = Depends(get_db)):
         .all()
     )
     active_matches = _dedupe_active_by_court(active_matches)
-    scheduled_matches = _sanitize_scheduled_queue(db, club_id, today)
+    scheduled_matches = _sanitize_scheduled_queue(
+        db, club_id, today, blocked_member_ids=blocked_lesson_ids
+    )
     available_courts = _available_courts(db, club_id, today)
     if available_courts:
         if scheduled_matches:
@@ -1251,7 +1287,7 @@ def get_dashboard(db: Session = Depends(get_db)):
                     )
                     if session:
                         session.is_in_match = True
-            _sanitize_scheduled_queue(db, club_id, today)
+            _sanitize_scheduled_queue(db, club_id, today, blocked_member_ids=blocked_lesson_ids)
             db.commit()
         else:
             matches, _, _, _ = generate_matches(db, club_id, now, court_numbers=available_courts)
@@ -1299,9 +1335,10 @@ def get_dashboard(db: Session = Depends(get_db)):
     )
     total_logged_in = len(sessions)
     in_match_count = sum(1 for session, _ in sessions if session.is_in_match)
-    lesson_ids: set[int] = set()
-    lesson_count = 0
-    scheduled_matches = _sanitize_scheduled_queue(db, club_id, today)
+    lesson_count = sum(1 for _, member in sessions if member.id in lesson_ids)
+    scheduled_matches = _sanitize_scheduled_queue(
+        db, club_id, today, blocked_member_ids=blocked_lesson_ids
+    )
     active_ids = _active_member_ids(db, club_id, today)
     scheduled_ids = {
         member_id
@@ -1309,23 +1346,25 @@ def get_dashboard(db: Session = Depends(get_db)):
         for member_id in [int(x) for x in (match.team_a + "," + match.team_b).split(",") if x]
     }
     next_match_ids = scheduled_ids
-    waiting_items = [
-        WaitingItem(
-            member_id=member.id,
-            label=format_waiting_label(member),
-            gender=member.gender,
-            is_lesson=member.id in lesson_ids,
-            wait_seconds=max(
-                0,
-                int((now - (session.wait_started_at or session.login_at)).total_seconds()),
+    waiting_items = []
+    for session, member in sessions:
+        if session.is_in_match or member.id in next_match_ids:
+            continue
+        waiting_items.append(
+            WaitingItem(
+                member_id=member.id,
+                label=format_waiting_label(member),
+                gender=member.gender,
+                is_lesson=member.id in lesson_ids,
+                wait_seconds=max(
+                    0,
+                    int((now - (session.wait_started_at or session.login_at)).total_seconds()),
+                )
+                if (session.wait_started_at or session.login_at)
+                else 0,
             )
-            if (session.wait_started_at or session.login_at)
-            else 0,
         )
-        for session, member in sessions
-        if not session.is_in_match and member.id not in next_match_ids
-    ]
-    lesson_lines = []
+    waiting_items.sort(key=lambda item: (1 if item.is_lesson else 0, -item.wait_seconds, item.member_id))
     # 큐 보충은 finish_match에서 처리 (대시보드는 표시만)
 
     court_schedule = []

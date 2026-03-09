@@ -17,6 +17,8 @@ from ..models import (
 from .lesson import (
     format_member_label,
     format_waiting_label,
+    get_lesson_schedule,
+    get_member_lesson_windows,
 )
 from .ranking import GRADE_ORDER
 
@@ -56,7 +58,7 @@ def _skill_score(member: Member) -> int:
     local_grade = member.rank_group[0] if member.rank_group else "E"
     local = GRADE_ORDER.get(local_grade, 1)
     national = GRADE_ORDER.get((member.national_grade or "E").upper(), 1)
-    return local + national * 10
+    return local + national * 12
 
 
 def _history_pairs(
@@ -558,7 +560,16 @@ def generate_matches(
         requested = [m for m in members if m.id in request_ids]
         # 요청자/상대가 대기자에 들어온 경우만 후순위로 이동
         members = normal + requested
-    lesson_ids: set[int] = set()
+    lesson_schedule = get_lesson_schedule(db, club_id, day_date)
+    lesson_windows = get_member_lesson_windows(lesson_schedule)
+    lesson_ids: set[int] = set(lesson_windows.keys())
+    blocked_lesson_ids = {
+        member_id
+        for member_id, (window_start, window_end) in lesson_windows.items()
+        if window_start <= now <= window_end
+    }
+    if blocked_lesson_ids:
+        members = [m for m in members if m.id not in blocked_lesson_ids]
     waiting_labels = [
         {
             "label": format_waiting_label(m),

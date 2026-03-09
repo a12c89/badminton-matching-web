@@ -8,7 +8,7 @@ from ..models import Member
 GRADE_ORDER = {"S": 6, "A": 5, "B": 4, "C": 3, "D": 2, "E": 1}
 ELO_BASE = 1000
 LOCAL_WEIGHT = 50
-NATIONAL_WEIGHT = 200
+NATIONAL_WEIGHT = 260
 K_BASE = 24
 STREAK_MULT = 1.1
 DECAY_DAYS = 30
