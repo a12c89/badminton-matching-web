@@ -159,6 +159,44 @@ def _cleanup_stale_sessions(db: Session, club_id: int, today: date) -> None:
         db.commit()
 
 
+def _match_member_ids(match: Match) -> list[int]:
+    return [int(x) for x in (match.team_a + "," + match.team_b).split(",") if x]
+
+
+def _sanitize_scheduled_queue(db: Session, club_id: int, day_date: date) -> list[Match]:
+    """scheduled 큐에서 중복/충돌 경기를 제거하고 queue_position을 1부터 재정렬합니다."""
+    scheduled = (
+        db.query(Match)
+        .filter(Match.club_id == club_id, Match.day_date == day_date, Match.status == "scheduled")
+        .order_by(Match.queue_position.asc(), Match.id.asc())
+        .all()
+    )
+    active_ids = _active_member_ids(db, club_id, day_date)
+    used_ids = set(active_ids)
+    kept: list[Match] = []
+    removed_ids: list[int] = []
+    for match in scheduled:
+        member_ids = _match_member_ids(match)
+        unique_ids = set(member_ids)
+        if len(member_ids) != 4 or len(unique_ids) != 4:
+            removed_ids.append(match.id)
+            db.delete(match)
+            continue
+        if unique_ids.intersection(used_ids):
+            removed_ids.append(match.id)
+            db.delete(match)
+            continue
+        kept.append(match)
+        used_ids.update(unique_ids)
+    if removed_ids:
+        db.query(MatchParticipant).filter(MatchParticipant.match_id.in_(removed_ids)).delete(
+            synchronize_session=False
+        )
+    for idx, match in enumerate(kept, start=1):
+        match.queue_position = idx
+    return kept
+
+
 def _remove_member_from_today_flow(db: Session, club_id: int, member_id: int, today: date) -> None:
     """로그아웃 회원을 오늘의 대기/다음경기/코트 흐름에서 완전히 제거합니다."""
     now = datetime.now()
@@ -185,14 +223,6 @@ def _remove_member_from_today_flow(db: Session, club_id: int, member_id: int, to
         db.query(MatchParticipant).filter(MatchParticipant.match_id.in_(removed_match_ids)).delete(
             synchronize_session=False
         )
-        remaining = (
-            db.query(Match)
-            .filter(Match.club_id == club_id, Match.day_date == today, Match.status == "scheduled")
-            .order_by(Match.queue_position.asc())
-            .all()
-        )
-        for idx, match in enumerate(remaining, start=1):
-            match.queue_position = idx
 
     affected_member_ids.discard(member_id)
     if affected_member_ids:
@@ -220,6 +250,7 @@ def _remove_member_from_today_flow(db: Session, club_id: int, member_id: int, to
         MatchRequest.member_id == member_id,
         MatchRequest.day_date == today,
     ).delete(synchronize_session=False)
+    _sanitize_scheduled_queue(db, club_id, today)
 
 
 def get_default_club(db: Session) -> Club:
@@ -955,16 +986,8 @@ def finish_match(payload: MatchFinishRequest, db: Session = Depends(get_db)):
         session.login_at = now
         session.wait_started_at = now
     db.commit()
-    next_scheduled = (
-        db.query(Match)
-        .filter(
-            Match.club_id == match.club_id,
-            Match.day_date == now.date(),
-            Match.status == "scheduled",
-        )
-        .order_by(Match.queue_position.asc())
-        .first()
-    )
+    scheduled_queue = _sanitize_scheduled_queue(db, match.club_id, now.date())
+    next_scheduled = scheduled_queue[0] if scheduled_queue else None
     if next_scheduled:
         next_scheduled.status = "active"
         next_scheduled.start_at = now
@@ -998,21 +1021,11 @@ def finish_match(payload: MatchFinishRequest, db: Session = Depends(get_db)):
             )
             if session:
                 session.is_in_match = True
-        db.query(Match).filter(
-            Match.club_id == match.club_id,
-            Match.day_date == now.date(),
-            Match.status == "scheduled",
-            Match.queue_position.isnot(None),
-        ).update({Match.queue_position: Match.queue_position - 1})
+        _sanitize_scheduled_queue(db, match.club_id, now.date())
         db.commit()
 
     # 큐 보충: 남은 scheduled가 3개 미만이면 추가 생성
-    scheduled_matches = (
-        db.query(Match)
-        .filter(Match.club_id == match.club_id, Match.day_date == now.date(), Match.status == "scheduled")
-        .order_by(Match.queue_position.asc())
-        .all()
-    )
+    scheduled_matches = _sanitize_scheduled_queue(db, match.club_id, now.date())
     active_ids = _active_member_ids(db, match.club_id, now.date())
     scheduled_ids = {
         member_id
@@ -1051,6 +1064,7 @@ def finish_match(payload: MatchFinishRequest, db: Session = Depends(get_db)):
             db.flush()
             scheduled_matches.append(scheduled)
             used_ids |= candidate_ids
+            _sanitize_scheduled_queue(db, match.club_id, now.date())
             added = True
             break
         if not added:
@@ -1100,12 +1114,7 @@ def get_dashboard(db: Session = Depends(get_db)):
         .order_by(Match.court_number.asc())
         .all()
     )
-    scheduled_matches = (
-        db.query(Match)
-        .filter(Match.club_id == club_id, Match.day_date == today, Match.status == "scheduled")
-        .order_by(Match.queue_position.asc())
-        .all()
-    )
+    scheduled_matches = _sanitize_scheduled_queue(db, club_id, today)
     available_courts = _available_courts(db, club_id, today)
     if available_courts:
         if scheduled_matches:
@@ -1152,15 +1161,7 @@ def get_dashboard(db: Session = Depends(get_db)):
                     )
                     if session:
                         session.is_in_match = True
-            # 재정렬
-            remaining = (
-                db.query(Match)
-                .filter(Match.club_id == club_id, Match.day_date == today, Match.status == "scheduled")
-                .order_by(Match.queue_position.asc())
-                .all()
-            )
-            for idx, match in enumerate(remaining, start=1):
-                match.queue_position = idx
+            _sanitize_scheduled_queue(db, club_id, today)
             db.commit()
         else:
             matches, _, _, _ = generate_matches(db, club_id, now, court_numbers=available_courts)
@@ -1209,72 +1210,7 @@ def get_dashboard(db: Session = Depends(get_db)):
     in_match_count = sum(1 for session, _ in sessions if session.is_in_match)
     lesson_ids: set[int] = set()
     lesson_count = 0
-    scheduled_matches = (
-        db.query(Match)
-        .filter(Match.club_id == club_id, Match.day_date == today, Match.status == "scheduled")
-        .order_by(Match.queue_position.asc())
-        .all()
-    )
-    if len(scheduled_matches) < 3:
-        active_ids = _active_member_ids(db, club_id, today)
-        kept_matches: list[Match] = []
-        kept_ids: set[int] = set()
-
-        def team_type(members: list[Member]) -> str:
-            males = sum(1 for m in members if m.gender == "M")
-            females = sum(1 for m in members if m.gender == "F")
-            if males == 2:
-                return "MM"
-            if females == 2:
-                return "FF"
-            return "MIX"
-
-        for match in scheduled_matches:
-            team_a_ids = [int(x) for x in match.team_a.split(",") if x]
-            team_b_ids = [int(x) for x in match.team_b.split(",") if x]
-            members = db.query(Member).filter(Member.id.in_(team_a_ids + team_b_ids)).all()
-            member_map = {m.id: m for m in members}
-            team_a = [member_map[mid] for mid in team_a_ids if mid in member_map]
-            team_b = [member_map[mid] for mid in team_b_ids if mid in member_map]
-            if team_type(team_a) == team_type(team_b):
-                kept_matches.append(match)
-                kept_ids.update(team_a_ids + team_b_ids)
-            else:
-                db.delete(match)
-
-        for idx, match in enumerate(kept_matches, start=1):
-            match.queue_position = idx
-
-        _, next_candidates, _, _ = generate_matches(
-            db,
-            club_id,
-            now,
-            court_numbers=[],
-            exclude_member_ids=active_ids | kept_ids,
-        )
-        if not next_candidates:
-            _, next_candidates, _, _ = generate_matches(
-                db,
-                club_id,
-                now,
-                court_numbers=[],
-                exclude_member_ids=active_ids | kept_ids,
-                force_create=True,
-            )
-        for candidate in next_candidates:
-            scheduled = Match(
-                club_id=club_id,
-                day_date=today,
-                status="scheduled",
-                queue_position=len(kept_matches) + 1,
-                team_a=",".join(str(m.id) for m in candidate.team_a),
-                team_b=",".join(str(m.id) for m in candidate.team_b),
-            )
-            db.add(scheduled)
-            kept_matches.append(scheduled)
-            if len(kept_matches) >= 3:
-                break
-        db.commit()
+    scheduled_matches = _sanitize_scheduled_queue(db, club_id, today)
     active_ids = _active_member_ids(db, club_id, today)
     scheduled_ids = {
         member_id
