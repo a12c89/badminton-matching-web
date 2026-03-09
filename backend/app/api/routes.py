@@ -367,6 +367,83 @@ def _sanitize_scheduled_queue(
     return kept
 
 
+def _scheduled_member_ids(matches: list[Match]) -> set[int]:
+    return {
+        member_id
+        for match in matches
+        for member_id in _match_member_ids(match)
+    }
+
+
+def _rebuild_scheduled_tail(
+    db: Session,
+    club_id: int,
+    today: date,
+    now: datetime,
+    blocked_member_ids: set[int],
+    lock_prefix_count: int,
+) -> list[Match]:
+    """큐 앞부분을 잠그고, 나머지 tail만 대기자 기준으로 재계산합니다."""
+    scheduled = _sanitize_scheduled_queue(db, club_id, today, blocked_member_ids=blocked_member_ids)
+    lock_prefix_count = max(0, min(lock_prefix_count, len(scheduled)))
+    locked = scheduled[:lock_prefix_count]
+    removable = scheduled[lock_prefix_count:]
+    if removable:
+        remove_ids = [m.id for m in removable]
+        db.query(MatchParticipant).filter(MatchParticipant.match_id.in_(remove_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(Match).filter(Match.id.in_(remove_ids)).delete(synchronize_session=False)
+        db.flush()
+
+    queue: list[Match] = list(locked)
+    used_ids = _active_member_ids(db, club_id, today) | _scheduled_member_ids(queue)
+    while len(queue) < 3:
+        _, next_candidates, _, _ = generate_matches(
+            db,
+            club_id,
+            now,
+            court_numbers=[],
+            exclude_member_ids=used_ids,
+        )
+        if not next_candidates:
+            _, next_candidates, _, _ = generate_matches(
+                db,
+                club_id,
+                now,
+                court_numbers=[],
+                exclude_member_ids=used_ids,
+                force_create=True,
+            )
+        if not next_candidates:
+            break
+        picked = None
+        for candidate in next_candidates:
+            candidate_ids = {m.id for m in (candidate.team_a + candidate.team_b)}
+            if candidate_ids.intersection(used_ids):
+                continue
+            picked = candidate
+            break
+        if not picked:
+            break
+        scheduled_match = Match(
+            club_id=club_id,
+            day_date=today,
+            status="scheduled",
+            queue_position=len(queue) + 1,
+            team_a=",".join(str(m.id) for m in picked.team_a),
+            team_b=",".join(str(m.id) for m in picked.team_b),
+        )
+        db.add(scheduled_match)
+        db.flush()
+        queue.append(scheduled_match)
+        used_ids.update(_match_member_ids(scheduled_match))
+
+    for idx, match in enumerate(queue, start=1):
+        match.queue_position = idx
+    return _sanitize_scheduled_queue(db, club_id, today, blocked_member_ids=blocked_member_ids)
+
+
 def _remove_member_from_today_flow(db: Session, club_id: int, member_id: int, today: date) -> None:
     """로그아웃 회원을 오늘의 대기/다음경기/코트 흐름에서 완전히 제거합니다."""
     now = _now_kst()
@@ -1348,6 +1425,17 @@ def get_dashboard(db: Session = Depends(get_db)):
     scheduled_matches = _sanitize_scheduled_queue(
         db, club_id, today, blocked_member_ids=blocked_lesson_ids
     )
+    # 큐 잠금 규칙:
+    # 1개면 1번만 가변, 2개면 1번 고정/2번 가변, 3개면 1·2번 고정/3번 가변
+    lock_prefix_count = max(0, len(scheduled_matches) - 1)
+    scheduled_matches = _rebuild_scheduled_tail(
+        db,
+        club_id,
+        today,
+        now,
+        blocked_member_ids=blocked_lesson_ids,
+        lock_prefix_count=lock_prefix_count,
+    )
     available_courts = _available_courts(db, club_id, today)
     if available_courts:
         if scheduled_matches:
@@ -1414,6 +1502,20 @@ def get_dashboard(db: Session = Depends(get_db)):
                     force_create=True,
                 )
                 _create_matches(db, club_id, matches)
+        # 코트 승격 이후 남은 큐 tail 재계산(앞 슬롯 고정 규칙 유지)
+        refreshed_scheduled = _sanitize_scheduled_queue(
+            db, club_id, today, blocked_member_ids=blocked_lesson_ids
+        )
+        refreshed_lock_prefix = max(0, len(refreshed_scheduled) - 1)
+        _rebuild_scheduled_tail(
+            db,
+            club_id,
+            today,
+            now,
+            blocked_member_ids=blocked_lesson_ids,
+            lock_prefix_count=refreshed_lock_prefix,
+        )
+        db.commit()
         active_matches = (
             db.query(Match)
             .filter(Match.club_id == club_id, Match.day_date == today, Match.status == "active")
